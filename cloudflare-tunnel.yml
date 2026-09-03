@@ -1,0 +1,6 @@
+tunnel: d224104f-501e-47d8-9803-6cb72f19e0d1
+credentials-file: C:\Users\SDC-03\.cloudflared\d224104f-501e-47d8-9803-6cb72f19e0d1.json
+
+ingress:
+  - service: http://localhost:5655
+  - service: http_status:404
