@@ -1,0 +1,6 @@
+name_of_the_equipment,location,receipt_date,make_model,idfn_no,overall_measurement_uncertainty,calibration_freq_months,date_of_last_calibration,calibration_due,pcr_number,ranges
+Digital Height Gauge Master,Metrology Lab 1,2025-01-10,Mitutoyo 570-312,EQ-IMP-001,± 0.002 mm,12,2025-06-15,2026-06-15,3001,0-300 mm;0.001 mm resolution
+Outside Micrometer Standard,Quality Dept,2025-02-15,Starrett 436.1,EQ-IMP-002,± 0.001 mm,12,2025-07-20,2026-07-20,3002,0-25 mm;0.001 mm resolution
+Digital Pressure Calibrator,Standards Room,2025-03-20,Fluke 700G,EQ-IMP-003,± 0.05%,6,2025-08-10,2026-02-10,3003,0-400 bar;0-5800 PSI
+Torque Wrench Tester Unit,Shop Floor A,2025-04-05,Norbar TTT 550,EQ-IMP-004,± 0.5%,12,2025-09-05,2026-09-05,3004,0-500 Nm
+Master Setting Ring Standard,Tool Room 2,2025-05-12,Carl Zeiss Master Ring,EQ-IMP-005,± 0.0005 mm,24,2025-10-01,2027-10-01,3005,0-100 mm

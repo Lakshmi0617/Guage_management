@@ -1,4 +1,7 @@
+from __future__ import annotations
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, Request, UploadFile, File, Form
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -20,13 +23,16 @@ import qrcode
 from app.database import get_db, SessionLocal
 from app import models, schemas
 from app.company_routes import router as company_router
-from app.auth import create_access_token, get_current_company_id, get_current_user_from_token, get_password_hash
+from app.auth import create_access_token, get_current_company_id, get_optional_company_id, get_current_user_from_token, get_optional_user_from_token, get_password_hash
 from app.security import verify_password
 import os
 from minio import Minio
 from datetime import datetime as dt
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 import threading
 import time
 import smtplib
@@ -48,7 +54,17 @@ import re
 import calendar
 import os
 
-app = FastAPI(title="Gauge Inventory Backend", version="0.1.0")
+app = FastAPI(title="Gauge Inventory Backend", version="0.1.0", docs_url=None)
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - Swagger UI",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_js_url="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-bundle.js",
+        swagger_css_url="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui.min.css",
+    )
 
 # Global exception handler for validation errors
 @app.exception_handler(RequestValidationError)
@@ -207,7 +223,7 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/users", response_model=schemas.UserPublic, status_code=status.HTTP_201_CREATED)
-def create_user(payload: schemas.CreateUserRequest, db: Session = Depends(get_db), company_id: int = Depends(get_current_company_id)):
+def create_user(payload: schemas.CreateUserRequest, db: Session = Depends(get_db), company_id: int | None = Depends(get_optional_company_id)):
     # Ensure employee_id column exists
     ensure_employee_id_column(db)
 
@@ -220,9 +236,8 @@ def create_user(payload: schemas.CreateUserRequest, db: Session = Depends(get_db
     if employee_id and len(employee_id) == 0:
         employee_id = None
 
-    # Always use current user's company_id for multi-tenancy
-    # Ignore any company_id from payload to prevent cross-tenant access
-    user_company_id = company_id
+    # Use company_id from token if present, otherwise payload.company_id, otherwise 1
+    user_company_id = company_id or payload.company_id or 1
 
     user = models.User(
         username=payload.username,
@@ -257,18 +272,25 @@ def create_user(payload: schemas.CreateUserRequest, db: Session = Depends(get_db
     return user
 
 
-@app.get("/users", response_model=list[schemas.UserPublic])
-def list_users(db: Session = Depends(get_db), company_id: int = Depends(get_current_company_id)):
+@app.get("/users", response_model=List[schemas.UserPublic])
+def list_users(db: Session = Depends(get_db), company_id: int | None = Depends(get_optional_company_id)):
     # Ensure employee_id column exists
     ensure_employee_id_column(db)
     # Use raw SQL to handle employee_id column safely
     try:
-        users_result = db.execute(text("""
-            SELECT id, username, password_hash, role, email, employee_id, created_at
-            FROM public.users
-            WHERE company_id = :cid
-            ORDER BY id DESC
-        """), {"cid": company_id}).mappings().all()
+        if company_id is not None:
+            users_result = db.execute(text("""
+                SELECT id, username, password_hash, role, email, employee_id, created_at
+                FROM public.users
+                WHERE company_id = :cid
+                ORDER BY id DESC
+            """), {"cid": company_id}).mappings().all()
+        else:
+            users_result = db.execute(text("""
+                SELECT id, username, password_hash, role, email, employee_id, created_at
+                FROM public.users
+                ORDER BY id DESC
+            """)).mappings().all()
         users = []
         for u in users_result:
             user = models.User(
@@ -2162,7 +2184,7 @@ def create_request(payload: schemas.RequestCreate, db: Session = Depends(get_db)
 
 
 # Gauge Tracker
-@app.get("/gauge-tracker", response_model=list[schemas.GaugeTrackPublic])
+@app.get("/gauge-tracker", response_model=List[schemas.GaugeTrackPublic])
 def list_gauge_tracks(
         limit: int = 100,
         offset: int = 0,
@@ -3118,8 +3140,18 @@ def ensure_import_cache_table(db: Session):
               id UUID PRIMARY KEY,
               created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               kind TEXT NOT NULL,
-              payload JSONB NOT NULL
-            )
+              payload JSONB NOT NULL,
+              company_id INT
+            );
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'import_payload_cache' AND column_name = 'company_id' AND is_nullable = 'NO'
+              ) THEN
+                ALTER TABLE public.import_payload_cache ALTER COLUMN company_id DROP NOT NULL;
+              END IF;
+            END$$;
             """
         ))
         db.commit()
@@ -3503,18 +3535,20 @@ async def equipment_import_validate(file: UploadFile = File(...), db: Session = 
     try:
         ensure_import_cache_table(db)
         db.execute(text(
-            "INSERT INTO public.import_payload_cache (id, kind, payload) VALUES (:id, :kind, CAST(:payload AS JSONB))"),
+            "INSERT INTO public.import_payload_cache (id, kind, payload) VALUES (:id, :kind, :payload)"),
                    {
                        "id": payload_id,
                        "kind": "equipment_import_validate",
                        "payload": json.dumps({"valid": valid, "row_errors": row_errors})
                    })
         db.commit()
-    except Exception:
+    except Exception as exc:
+        print(f"[ERROR] Failed to save import_payload_cache: {exc}")
         try:
             db.rollback()
         except Exception:
             pass
+        raise HTTPException(status_code=500, detail=f"Failed to cache import payload: {str(exc)}")
 
     return {
         "total_rows": len(rows) - skipped_sample,
@@ -3541,11 +3575,7 @@ def ensure_audit_tables(db: Session):
               updated_count INTEGER NOT NULL DEFAULT 0,
               skipped_count INTEGER NOT NULL DEFAULT 0,
               error_count INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        ))
-        db.execute(text(
-            """
+            );
             CREATE TABLE IF NOT EXISTS public.audit_import_rows (
               import_id UUID NOT NULL,
               row_index INTEGER NOT NULL,
@@ -3554,7 +3584,33 @@ def ensure_audit_tables(db: Session):
               message TEXT,
               previous_snapshot JSONB,
               new_snapshot JSONB
-            )
+            );
+            DO $$
+            BEGIN
+              -- Drop NOT NULL on company_id / started_at if present
+              IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_import_rows' AND column_name = 'company_id' AND is_nullable = 'NO') THEN
+                ALTER TABLE public.audit_import_rows ALTER COLUMN company_id DROP NOT NULL;
+              END IF;
+              IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_imports' AND column_name = 'company_id' AND is_nullable = 'NO') THEN
+                ALTER TABLE public.audit_imports ALTER COLUMN company_id DROP NOT NULL;
+              END IF;
+              IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_imports' AND column_name = 'started_at' AND is_nullable = 'NO') THEN
+                ALTER TABLE public.audit_imports ALTER COLUMN started_at DROP NOT NULL;
+              END IF;
+
+              IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_import_rows' AND column_name = 'action') THEN
+                ALTER TABLE public.audit_import_rows ADD COLUMN action TEXT;
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_import_rows' AND column_name = 'message') THEN
+                ALTER TABLE public.audit_import_rows ADD COLUMN message TEXT;
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_import_rows' AND column_name = 'previous_snapshot') THEN
+                ALTER TABLE public.audit_import_rows ADD COLUMN previous_snapshot JSONB;
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_import_rows' AND column_name = 'new_snapshot') THEN
+                ALTER TABLE public.audit_import_rows ADD COLUMN new_snapshot JSONB;
+              END IF;
+            END$$;
             """
         ))
         db.commit()
@@ -3565,17 +3621,17 @@ def ensure_audit_tables(db: Session):
             pass
 
 
-def _sync_ranges(db: Session, gauge_id: int, ranges: list[str] | None):
+def _sync_ranges(db: Session, gauge_id: int, ranges: list[str] | None, company_id: int = 1):
     try:
         db.execute(text(
-            "CREATE TABLE IF NOT EXISTS public.gauge_ranges (id SERIAL PRIMARY KEY, gauge_id INTEGER NOT NULL, label TEXT NOT NULL)"))
+            "CREATE TABLE IF NOT EXISTS public.gauge_ranges (id SERIAL PRIMARY KEY, gauge_id INTEGER NOT NULL, label TEXT NOT NULL, company_id INTEGER DEFAULT 1)"))
     except Exception:
         pass
     db.execute(text("DELETE FROM public.gauge_ranges WHERE gauge_id = :gid"), {"gid": gauge_id})
     if ranges:
         for lbl in ranges:
-            db.execute(text("INSERT INTO public.gauge_ranges (gauge_id, label) VALUES (:gid, :lbl)"),
-                       {"gid": gauge_id, "lbl": lbl})
+            db.execute(text("INSERT INTO public.gauge_ranges (gauge_id, label, company_id) VALUES (:gid, :lbl, :cid)"),
+                       {"gid": gauge_id, "lbl": lbl, "cid": company_id})
 
 
 @app.post("/api/equipment/import/commit")
@@ -3659,10 +3715,10 @@ def equipment_import_commit(
                     INSERT INTO public.equipment_used_for_calibration (
                       name_of_the_equipment, location, receipt_date, make_model, idfn_no,
                       overall_measurement_uncertainty, calibration_freq_months, date_of_last_calibration,
-                      calibration_due, pcr_number
+                      calibration_due, pcr_number, company_id
                     ) VALUES (
                       :name, :loc, CAST(:receipt AS DATE), :mmodel, :idfn,
-                      :omu, :freq, CAST(:last AS DATE), CAST(:due AS DATE), :pcr
+                      :omu, :freq, CAST(:last AS DATE), CAST(:due AS DATE), :pcr, :cid
                     ) RETURNING gauge_id
                     """
                 ), {
@@ -3676,12 +3732,13 @@ def equipment_import_commit(
                     "last": v.get("date_of_last_calibration"),
                     "due": due,
                     "pcr": v.get("pcr_number"),
+                    "cid": 1,
                 })
                 gid = int(res.fetchone()[0])
                 _sync_ranges(db, gid, v.get("ranges"))
                 created += 1
                 db.execute(text(
-                    "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot) VALUES (:iid, :idx, :pcr, 'created', NULL, NULL, CAST(:new AS JSONB))"
+                    "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot, company_id) VALUES (:iid, :idx, :pcr, 'created', NULL, NULL, CAST(:new AS JSONB), 1)"
                 ), {"iid": import_id, "idx": idx, "pcr": v.get("pcr_number"),
                     "new": json.dumps({k: v.get(k) for k in v if not k.startswith("_")})})
             else:
@@ -3689,7 +3746,7 @@ def equipment_import_commit(
                     # treat as skip when conflict and no override
                     skipped += 1
                     db.execute(text(
-                        "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot) VALUES (:iid, :idx, :pcr, 'skipped', 'conflict without override', CAST(:prev AS JSONB), CAST(:new AS JSONB))"
+                        "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot, company_id) VALUES (:iid, :idx, :pcr, 'skipped', 'conflict without override', CAST(:prev AS JSONB), CAST(:new AS JSONB), 1)"
                     ), {"iid": import_id, "idx": idx, "pcr": int(p), "prev": json.dumps(dict(existing), default=str),
                         "new": json.dumps({k: v.get(k) for k in v if not k.startswith("_")})})
                 else:
@@ -3724,27 +3781,27 @@ def equipment_import_commit(
                     _sync_ranges(db, gid, v.get("ranges"))
                     updated += 1
                     db.execute(text(
-                        "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot) VALUES (:iid, :idx, :pcr, 'updated', NULL, CAST(:prev AS JSONB), CAST(:new AS JSONB))"
+                        "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot, company_id) VALUES (:iid, :idx, :pcr, 'updated', NULL, CAST(:prev AS JSONB), CAST(:new AS JSONB), 1)"
                     ), {"iid": import_id, "idx": idx, "pcr": int(p), "prev": json.dumps(dict(existing), default=str),
                         "new": json.dumps({k: v.get(k) for k in v if not k.startswith("_")})})
         except IntegrityError as e:
             err_count += 1
             db.rollback()
             db.execute(text(
-                "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot) VALUES (:iid, :idx, :pcr, 'error', :msg, NULL, CAST(:new AS JSONB))"
+                "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot, company_id) VALUES (:iid, :idx, :pcr, 'error', :msg, NULL, CAST(:new AS JSONB), 1)"
             ), {"iid": import_id, "idx": idx, "pcr": v.get("pcr_number"), "msg": str(e),
                 "new": json.dumps({k: v.get(k) for k in v if not k.startswith("_")})})
         except Exception as e:
             err_count += 1
             db.rollback()
             db.execute(text(
-                "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot) VALUES (:iid, :idx, :pcr, 'error', :msg, NULL, CAST(:new AS JSONB))"
+                "INSERT INTO public.audit_import_rows (import_id, row_index, pcr_number, action, message, previous_snapshot, new_snapshot, company_id) VALUES (:iid, :idx, :pcr, 'error', :msg, NULL, CAST(:new AS JSONB), 1)"
             ), {"iid": import_id, "idx": idx, "pcr": v.get("pcr_number"), "msg": str(e),
                 "new": json.dumps({k: v.get(k) for k in v if not k.startswith("_")})})
 
     # finalize audit summary
     db.execute(text(
-        "INSERT INTO public.audit_imports (id, user_name, file_name, created_count, updated_count, skipped_count, error_count) VALUES (:id, :user, :file, :c, :u, :s, :e)"
+        "INSERT INTO public.audit_imports (id, user_name, file_name, created_count, updated_count, skipped_count, error_count, company_id) VALUES (:id, :user, :file, :c, :u, :s, :e, 1)"
     ), {"id": import_id, "user": actor, "file": file_name, "c": created, "u": updated, "s": skipped, "e": err_count})
     db.commit()
 
@@ -4666,3 +4723,11 @@ if __name__ == "__main__":
         workers=1,
         log_level="debug"
     )
+
+
+    # ''''''to run the backend below is the run command'''''''''timezone
+    # uvicorn app.main:app --reload --port 5655
+
+    # or use this below command
+    # python -m uvicorn app.main:app --reload --port 5655
+

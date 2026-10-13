@@ -14,3 +14,8 @@ email-validator>=1.0.3
 pydantic[email]>=1.10.0
 dnspython>=2.0.0
 python-multipart>=0.0.5
+PyJWT>=2.9.0
+eval_type_backport>=0.4.0
+backports.zoneinfo;python_version<"3.9"
+tzdata
+bcrypt==3.2.2

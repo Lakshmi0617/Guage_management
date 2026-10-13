@@ -1,7 +1,9 @@
+from __future__ import annotations
 """
 Company-related API endpoints.
 """
 
+from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -42,7 +44,7 @@ def create_company(payload: schemas.CreateCompanyRequest, db: Session = Depends(
         raise HTTPException(status_code=500, detail=f"Failed to create company: {str(e)}")
 
 
-@router.get("/", response_model=list[schemas.CompanyResponse])
+@router.get("/", response_model=List[schemas.CompanyResponse])
 def list_companies(db: Session = Depends(get_db)):
     """List all companies (admin only)"""
     companies = db.query(models.Company).filter(models.Company.is_active == True).all()

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Company utilities for multi-tenant support.
 """

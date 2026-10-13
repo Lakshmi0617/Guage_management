@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Authentication utilities for multi-tenancy
 """
@@ -60,9 +61,30 @@ def get_current_user_from_token(authorization: str = Header(None), db: Session =
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
 
+def get_optional_user_from_token(authorization: str | None = Header(None), db: Session = Depends(database.get_db)):
+    """Get current user from Authorization header token if present, else None"""
+    if not authorization:
+        return None
+    try:
+        token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+        payload = verify_token(token)
+        user_id = payload.get("user_id")
+        if not user_id:
+            return None
+        return db.query(models.User).filter(models.User.id == user_id).first()
+    except Exception:
+        return None
+
+def get_optional_company_id(current_user: models.User | None = Depends(get_optional_user_from_token)):
+    """Get current user's company_id if logged in, else None"""
+    if current_user:
+        return current_user.company_id
+    return None
+
 def get_current_company_id(current_user: models.User = Depends(get_current_user_from_token)):
     """Get current user's company_id"""
     return current_user.company_id
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash"""
